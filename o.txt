@@ -1,0 +1,1867 @@
+import asyncio
+import base64
+import json
+import logging
+import os
+import re
+import sqlite3
+import time
+from datetime import datetime, timedelta
+from typing import Any, Awaitable, Callable, Dict, List
+from urllib.parse import quote
+
+import aiohttp
+from aiogram import BaseMiddleware, Bot, Dispatcher, Router, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    Message,
+    CallbackQuery,
+    BusinessConnection,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
+    WebAppInfo,
+    LinkPreviewOptions,
+    TelegramObject,
+    User,
+    BufferedInputFile
+)
+
+# ================= КОНФИГУРАЦИЯ ШАБЛОНА =================
+# Замените значения на свои или передавайте через переменные окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin_username").replace("@", "")
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-domain.github.io/webapp/")
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "")  # Например "@channel" или "" для отключения проверки
+
+DB_NAME = "offers_bot.db"
+OFFER_DURATION_HOURS = 6
+SILENT_EDIT_CHECKPOINTS = [300, 240, 180, 120, 60, 30, 15, 5]
+PAGE_SIZE = 6
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+router = Router()
+
+# ================= ТЕКСТЫ И ЯЗЫКИ =================
+NO_USERNAME_WARNING_RU = (
+    "⚠️ <b>Необходимо установить юзернейм!</b>\n\n"
+    "У вашего аккаунта не указан <code>@username</code> для получения подарков.\n"
+    "❗️ <b>ВНИМАНИЕ:</b> Если вы не установите юзернейм в настройках Telegram или через команду "
+    "<code>/setreceiver @username</code>, то при передаче <b>ваш NFT-подарок сгорит!</b>"
+)
+
+LANGS = {
+    "ru": {
+        "offer_header": "Вам предлагает оффер",
+        "for_gift": "за подарок",
+        "for_gifts": "за подарки",
+        "offers_left": "Осталось",
+        "accept_word": "Принять",
+        "decline_word": "Отклонить",
+        "confirm_word": "Подтвердить отправку",
+        "i_sent_btn": "Я отправил подарки",
+        "back": "Назад",
+        "sold_text": (
+            "{icon} Подарки были успешно проданы за <b>{price} {curr}</b>!\n\n"
+            "Список лотов:\n{gifts_list}\n\n"
+            "Для завершения <a href='{gift_link}'>передайте подарки</a>\n"
+            "получателю <a href='{gift_link}'>@{receiver}</a>"
+        ),
+        "not_sent_alert": "Вы еще не передали все подарки.\nНе получено: {missing}",
+        "not_sent_menu": (
+            "⚠️ <b>Подарки еще не получены</b>\n\n"
+            "На аккаунте @{receiver} еще не обнаружены лоты:\n{missing}\n\n"
+            "Для завершения <a href='{gift_link}'>передайте подарки</a> и нажмите проверку повторно:"
+        ),
+        "deal_completed_menu": (
+            "{icon} <b>Сделка завершена</b>\n\n"
+            "Квитанция: <code>#TX-00{id}</code>\n"
+            "Лоты:\n{gifts_list}\n"
+            "Получатель: <a href='https://t.me/{receiver}'>@{receiver}</a>\n"
+            "Сумма: <b>{price} {curr}</b>\n"
+            "Статус: <b>Оплачено</b>"
+        ),
+        "transfer_btn": "Передать NFT @",
+        "how_to": "Инструкция",
+        "declined": "{icon} <b>Вы отклонили оффер</b>",
+        "declined_alert": "Вы отклонили оффер",
+        "expired_text": "⏳ <b>Оффер просрочен (истекли 6 часов)</b>",
+        "accepted_step2": (
+            "{icon} <b>Подтверждение сделки</b>\n\n"
+            "Вам предлагает оффер <a href='https://t.me/{receiver}'>@{receiver}</a>\n"
+            "Лоты:\n{gifts_list}\n"
+            "Сумма к зачислению: <b>{price} {curr}</b>\n\n"
+            "Подтвердите отправку подарков:"
+        ),
+        "no_sub": "У вас нет активной подписки.\nИспользуйте <code>/tempagifts</code> для активации доступа.",
+        "lang_changed": "Язык офферов: <b>RU</b>"
+    },
+    "en": {
+        "offer_header": "You have an offer from",
+        "for_gift": "for gift",
+        "for_gifts": "for gifts",
+        "offers_left": "Remaining",
+        "accept_word": "Accept",
+        "decline_word": "Decline",
+        "confirm_word": "Confirm sending",
+        "i_sent_btn": "I sent the gifts",
+        "back": "Back",
+        "sold_text": (
+            "{icon} Gifts were successfully sold for <b>{price} {curr}</b>!\n\n"
+            "Items:\n{gifts_list}\n\n"
+            "To complete the deal, <a href='{gift_link}'>send gifts</a>\n"
+            "to <a href='{gift_link}'>@{receiver}</a>"
+        ),
+        "not_sent_alert": "Not all gifts transferred yet.\nMissing: {missing}",
+        "not_sent_menu": (
+            "⚠️ <b>Gifts not received yet</b>\n\n"
+            "Missing on @{receiver}'s account:\n{missing}\n\n"
+            "Please <a href='{gift_link}'>send gifts</a> and verify again:"
+        ),
+        "deal_completed_menu": (
+            "{icon} <b>Deal Completed</b>\n\n"
+            "Receipt: <code>#TX-00{id}</code>\n"
+            "Items:\n{gifts_list}\n"
+            "Receiver: <a href='https://t.me/{receiver}'>@{receiver}</a>\n"
+            "Amount: <b>{price} {curr}</b>\n"
+            "Status: <b>Paid</b>"
+        ),
+        "transfer_btn": "Transfer NFT @",
+        "how_to": "Instructions",
+        "declined": "{icon} <b>You declined the offer</b>",
+        "declined_alert": "You declined the offer",
+        "expired_text": "⏳ <b>Offer expired (6 hours passed)</b>",
+        "accepted_step2": (
+            "{icon} <b>Deal Confirmation</b>\n\n"
+            "Offer from <a href='https://t.me/{receiver}'>@{receiver}</a>\n"
+            "Items:\n{gifts_list}\n"
+            "Amount to receive: <b>{price} {curr}</b>\n\n"
+            "Please confirm sending gifts:"
+        ),
+        "no_sub": "You don't have an active subscription.\nUse <code>/tempagifts</code> to activate access.",
+        "lang_changed": "Offer language: <b>EN</b>"
+    }
+}
+
+
+# ================= ПАРСЕР ССЫЛОК =================
+def normalize_nft_url(url: str) -> str:
+    if not url:
+        return ""
+    u = str(url).strip()
+    m = re.search(r"(?:t\.me|telegram\.me)/nft/([a-zA-Z0-9_-]+)", u, re.IGNORECASE)
+    if m:
+        return f"https://t.me/nft/{m.group(1)}"
+    m2 = re.match(r"^([a-zA-Z0-9_-]+-\d+)$", u)
+    if m2:
+        return f"https://t.me/nft/{m2.group(1)}"
+    return ""
+
+
+def extract_all_nft_urls(raw_input: Any) -> List[str]:
+    if not raw_input:
+        return []
+    text = " ".join(str(x) for x in raw_input) if isinstance(raw_input, list) else str(raw_input)
+
+    results = []
+    for match in re.finditer(r"(?:https?://)?(?:www\.)?(?:t\.me|telegram\.me)/nft/([a-zA-Z0-9_-]+)", text, re.IGNORECASE):
+        clean = f"https://t.me/nft/{match.group(1)}"
+        if clean not in results:
+            results.append(clean)
+
+    if not results:
+        for token in re.split(r"[\s,;\n]+", text.strip()):
+            norm = normalize_nft_url(token)
+            if norm and norm not in results:
+                results.append(norm)
+
+    return results
+
+
+def parse_nft_name(url: str) -> str:
+    norm = normalize_nft_url(url) or str(url)
+    slug = norm.rstrip("/").split("/")[-1]
+    if "-" in slug:
+        name_part, num_part = slug.rsplit("-", 1)
+        if num_part.isdigit():
+            return f"{name_part} #{num_part}"
+    return slug or "NFT Gift"
+
+
+def render_gifts_list_html(urls: List[str]) -> str:
+    if len(urls) == 1:
+        return f"<a href='{urls[0]}'>{parse_nft_name(urls[0])}</a>"
+    return "\n".join([f"• <a href='{u}'>{parse_nft_name(u)}</a>" for u in urls])
+
+
+# ================= БАЗА ДАННЫХ =================
+def init_db():
+    with sqlite3.connect(DB_NAME, timeout=10) as conn:
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        cursor = conn.cursor()
+        cursor.execute("CREATE TABLE IF NOT EXISTS subscriptions (user_id INTEGER PRIMARY KEY, expires_at TIMESTAMP)")
+        cursor.execute("CREATE TABLE IF NOT EXISTS business_connections (connection_id TEXT PRIMARY KEY, owner_id INTEGER, can_reply BOOLEAN)")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS offers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER,
+                message_id INTEGER DEFAULT 0,
+                business_connection_id TEXT DEFAULT '',
+                owner_id INTEGER,
+                nft_url TEXT,
+                nft_name TEXT,
+                price REAL,
+                currency TEXT,
+                created_at TIMESTAMP,
+                status TEXT DEFAULT 'active',
+                gift_received INTEGER DEFAULT 0,
+                last_checkpoint INTEGER DEFAULT 360
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS business_chats (
+                chat_id INTEGER,
+                owner_id INTEGER,
+                connection_id TEXT,
+                title TEXT,
+                username TEXT,
+                updated_at TIMESTAMP,
+                PRIMARY KEY (chat_id, owner_id)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                joined_at TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE TABLE IF NOT EXISTS bot_config (key TEXT PRIMARY KEY, value TEXT)")
+        conn.commit()
+
+
+def set_config(key: str, value: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT OR REPLACE INTO bot_config (key, value) VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+
+
+def get_config(key: str, default: str = None) -> str | None:
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute("SELECT value FROM bot_config WHERE key = ?", (key,)).fetchone()
+        return row[0] if row else default
+
+
+def save_user_profile(user: User):
+    if not user:
+        return
+    clean_uname = user.username.replace("@", "").strip() if user.username else ""
+    full_name = " ".join(filter(None, [user.first_name, user.last_name])).strip()
+
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            INSERT INTO users (user_id, username, full_name, joined_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username=excluded.username,
+                full_name=excluded.full_name
+        """, (user.id, clean_uname, full_name, datetime.now().isoformat()))
+        conn.commit()
+
+    if clean_uname:
+        set_config(f"user_uname_{user.id}", clean_uname)
+    if full_name:
+        set_config(f"user_name_{user.id}", full_name)
+
+
+def set_user_receiver(user_id: int, username: str):
+    clean_username = username.replace("@", "").strip()
+    set_config(f"receiver_{user_id}", clean_username)
+
+
+def get_user_receiver(user_id: int, fallback_username: str = None) -> str:
+    saved = get_config(f"receiver_{user_id}")
+    if saved and saved.strip():
+        return saved.strip()
+    if fallback_username and fallback_username.strip():
+        clean = fallback_username.replace("@", "").strip()
+        set_user_receiver(user_id, clean)
+        return clean
+    return ""
+
+
+def get_buyer_display(owner_id: int) -> str:
+    rec = get_user_receiver(owner_id)
+    if rec:
+        return f"@{rec}"
+    uname = get_config(f"user_uname_{owner_id}")
+    if uname:
+        return f"@{uname}"
+    name = get_config(f"user_name_{owner_id}")
+    if name:
+        return name
+    return f"Покупатель #{owner_id}"
+
+
+def get_seller_display(chat_id: int) -> str:
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute(
+            "SELECT username, title FROM business_chats WHERE chat_id = ? ORDER BY updated_at DESC LIMIT 1",
+            (chat_id,)
+        ).fetchone()
+        if row:
+            uname, title = row
+            if uname:
+                return f"@{uname.replace('@', '').strip()}"
+            if title:
+                return re.sub(r"\s*\(<code>\d+<\/code>\)|\s*\(\d+\)", "", title).strip()
+    return f"Клиент (ID: {chat_id})"
+
+
+def get_user_lang(user_id: int) -> str:
+    return get_config(f"lang_{user_id}", "ru")
+
+
+def set_user_lang(user_id: int, lang: str):
+    set_config(f"lang_{user_id}", lang)
+
+
+# ================= НАСТРОЙКИ СТИЛЯ =================
+def save_user_style(
+    user_id: int,
+    preview: str,
+    layout: str,
+    icons: str,
+    pos: str,
+    template: str = "default",
+    bold: str = "0",
+    custom_accept: str = "",
+    custom_decline: str = ""
+):
+    set_config(f"style_prev_{user_id}", preview)
+    set_config(f"style_layout_{user_id}", layout)
+    set_config(f"style_icons_{user_id}", icons)
+    set_config(f"style_pos_{user_id}", pos)
+    set_config(f"style_tpl_{user_id}", template if template in ["default", "original"] else "default")
+    set_config(f"style_bold_{user_id}", "1" if str(bold) == "1" else "0")
+    set_config(f"style_acc_{user_id}", custom_accept.strip()[:28])
+    set_config(f"style_dec_{user_id}", custom_decline.strip()[:28])
+
+
+def get_user_style(user_id: int) -> dict:
+    tpl = get_config(f"style_tpl_{user_id}", "default")
+    if tpl not in ["default", "original"]:
+        tpl = "default"
+    return {
+        "preview": get_config(f"style_prev_{user_id}", "1"),
+        "layout": get_config(f"style_layout_{user_id}", "row"),
+        "icons": get_config(f"style_icons_{user_id}", "0"),
+        "pos": get_config(f"style_pos_{user_id}", "down"),
+        "template": tpl,
+        "bold": get_config(f"style_bold_{user_id}", "0"),
+        "custom_accept": get_config(f"style_acc_{user_id}", ""),
+        "custom_decline": get_config(f"style_dec_{user_id}", "")
+    }
+
+
+def apply_user_bold(owner_id: int, text: str) -> str:
+    if not owner_id:
+        return text
+    st = get_user_style(owner_id)
+    if st.get("bold", "0") == "1":
+        clean_inner = text.replace("<b>", "").replace("</b>", "")
+        return f"<b>{clean_inner}</b>"
+    return text
+
+
+def is_admin(user: User) -> bool:
+    if not user:
+        return False
+    if ADMIN_USERNAME and user.username and user.username.lower() == ADMIN_USERNAME.lower():
+        set_config("admin_id", str(user.id))
+        return True
+    return get_config("admin_id") == str(user.id)
+
+
+async def check_user_subscription(bot: Bot, user_id: int) -> bool:
+    if not REQUIRED_CHANNEL:
+        return True
+    admin_id = get_config("admin_id")
+    if admin_id and str(user_id) == str(admin_id):
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=REQUIRED_CHANNEL, user_id=user_id)
+        return member.status in ["creator", "administrator", "member"]
+    except Exception as e:
+        logging.warning(f"Ошибка проверки подписки на {REQUIRED_CHANNEL}: {e}")
+        return True
+
+
+def get_sub_check_keyboard() -> InlineKeyboardMarkup:
+    channel_clean = REQUIRED_CHANNEL.replace("@", "").strip()
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Подписаться на канал", url=f"https://t.me/{channel_clean}")],
+        [InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_subscription_btn")]
+    ])
+
+
+def add_subscription(user_id: int, days: int) -> datetime:
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT expires_at FROM subscriptions WHERE user_id = ?", (user_id,))
+        row = cursor.fetchone()
+        now = datetime.now()
+        new_exp = (datetime.fromisoformat(row[0]) if row and datetime.fromisoformat(row[0]) > now else now) + timedelta(days=days)
+        cursor.execute("INSERT OR REPLACE INTO subscriptions (user_id, expires_at) VALUES (?, ?)", (user_id, new_exp.isoformat()))
+        conn.commit()
+        return new_exp
+
+
+def remove_subscription(user_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("DELETE FROM subscriptions WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+
+def has_active_subscription(user: User) -> bool:
+    if is_admin(user):
+        return True
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute("SELECT expires_at FROM subscriptions WHERE user_id = ?", (user.id,)).fetchone()
+        if not row:
+            return False
+        return datetime.fromisoformat(row[0]) > datetime.now()
+
+
+def save_business_connection(conn_id: str, owner_id: int, can_reply: bool):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("INSERT OR REPLACE INTO business_connections (connection_id, owner_id, can_reply) VALUES (?, ?, ?)", (conn_id, owner_id, can_reply))
+        conn.commit()
+
+
+def get_connection_owner(conn_id: str) -> int | None:
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute("SELECT owner_id FROM business_connections WHERE connection_id = ?", (conn_id,)).fetchone()
+        return row[0] if row else None
+
+
+def get_owner_default_conn_id(owner_id: int) -> str:
+    with sqlite3.connect(DB_NAME) as conn:
+        row = conn.execute("SELECT connection_id FROM business_connections WHERE owner_id = ? ORDER BY rowid DESC LIMIT 1", (owner_id,)).fetchone()
+        if row and row[0]:
+            return row[0]
+        row2 = conn.execute("SELECT connection_id FROM business_chats WHERE owner_id = ? ORDER BY updated_at DESC LIMIT 1", (owner_id,)).fetchone()
+        return row2[0] if row2 else ""
+
+
+def save_business_chat(chat_id: int, owner_id: int, conn_id: str, title: str, username: str):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO business_chats (chat_id, owner_id, connection_id, title, username, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (chat_id, owner_id, conn_id, title or "Личный чат", username or "", datetime.now().isoformat()))
+        conn.commit()
+
+
+def get_owner_chats_encoded(owner_id: int) -> str:
+    with sqlite3.connect(DB_NAME) as conn:
+        rows = conn.execute("""
+            SELECT chat_id, connection_id, title, username 
+            FROM business_chats 
+            WHERE owner_id = ? 
+            ORDER BY updated_at DESC LIMIT 50
+        """, (owner_id,)).fetchall()
+
+    chats_data = [{"id": r[0], "cid": r[1], "t": r[2][:22], "u": r[3]} for r in rows]
+    raw_json = json.dumps(chats_data, ensure_ascii=False)
+    return base64.urlsafe_b64encode(raw_json.encode("utf-8")).decode("utf-8")
+
+
+def create_offer(chat_id: int, message_id: int, conn_id: str, owner_id: int, urls: List[str], price: float, currency_code: str, created_at: str) -> int:
+    stored_urls = ",".join(urls)
+    names = ", ".join([parse_nft_name(u) for u in urls])
+    with sqlite3.connect(DB_NAME) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            INSERT INTO offers (chat_id, message_id, business_connection_id, owner_id, nft_url, nft_name, price, currency, created_at, status, gift_received, last_checkpoint)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', 0, 360)
+        """, (chat_id, message_id, conn_id, owner_id, stored_urls, names, price, currency_code, created_at))
+        conn.commit()
+        return cursor.lastrowid
+
+
+def update_offer_message_id(offer_id: int, message_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("UPDATE offers SET message_id = ? WHERE id = ?", (message_id, offer_id))
+        conn.commit()
+
+
+def mark_offer_completed(offer_id: int):
+    with sqlite3.connect(DB_NAME) as conn:
+        conn.execute("UPDATE offers SET status = 'completed', gift_received = 1 WHERE id = ?", (offer_id,))
+        conn.commit()
+
+
+def get_offer_by_id(offer_id: int) -> tuple | None:
+    with sqlite3.connect(DB_NAME) as conn:
+        return conn.execute(
+            "SELECT id, chat_id, message_id, business_connection_id, owner_id, nft_url, nft_name, price, currency, created_at, status, gift_received FROM offers WHERE id = ?",
+            (offer_id,)
+        ).fetchone()
+
+
+# ================= АВТОМАТИЧЕСКИЙ ДЕТЕКТ ПОДАРКА =================
+class BusinessChatTrackerMiddleware(BaseMiddleware):
+    async def __call__(self, handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]], event: TelegramObject, data: Dict[str, Any]) -> Any:
+        if isinstance(event, Message) and event.business_connection_id:
+            conn_id = event.business_connection_id
+            owner_id = get_connection_owner(conn_id)
+            if not owner_id and event.from_user:
+                owner_id = event.from_user.id
+                save_business_connection(conn_id, owner_id, True)
+
+            if owner_id:
+                full_name = " ".join(filter(None, [event.chat.first_name, event.chat.last_name]))
+                chat_title = full_name or event.chat.title or "Личный чат"
+                save_business_chat(event.chat.id, owner_id, conn_id, chat_title, event.chat.username or "")
+
+            has_gift = bool(
+                event.gift
+                or getattr(event, "unique_gift", None)
+                or (getattr(event, "action", None) and hasattr(event.action, "gift"))
+            )
+
+            if has_gift and owner_id:
+                with sqlite3.connect(DB_NAME) as conn:
+                    row = conn.execute("""
+                        SELECT id, owner_id, nft_url, price, currency, message_id
+                        FROM offers
+                        WHERE chat_id = ? AND status = 'active'
+                        ORDER BY id DESC LIMIT 1
+                    """, (event.chat.id,)).fetchone()
+
+                if row:
+                    offer_id, off_owner_id, nft_url_str, price_raw, currency_raw, card_msg_id = row
+                    urls = nft_url_str.split(",")
+                    receiver_username = get_user_receiver(off_owner_id)
+
+                    all_received, _ = await verify_all_gifts_received(urls, receiver_username, 0)
+                    if not all_received:
+                        return await handler(event, data)
+
+                    mark_offer_completed(offer_id)
+
+                    price = int(price_raw) if float(price_raw).is_integer() else price_raw
+                    curr_display = render_currency(currency_raw)
+
+                    seller_display = get_seller_display(event.chat.id)
+                    buyer_display = get_buyer_display(off_owner_id)
+                    gifts_list = render_gifts_list_html(urls)
+
+                    deal_done_notify = (
+                        f"🎉 <b>NFT подтвержден на профиле {buyer_display}! Сделка закрыта.</b>\n\n"
+                        f"Квитанция: <code>#TX-00{offer_id}</code>\n"
+                        f"👤 <b>Продавец (клиент):</b> {seller_display}\n"
+                        f"📥 <b>Покупатель:</b> {buyer_display}\n"
+                        f"💰 <b>Выплачено:</b> {price} {curr_display}\n"
+                        f"🎁 <b>Лоты:</b>\n{gifts_list}"
+                    )
+                    asyncio.create_task(send_dm_event_notification(event.bot, off_owner_id, deal_done_notify))
+
+                    if card_msg_id:
+                        lang = get_user_lang(off_owner_id)
+                        preview = build_offer_preview_options(off_owner_id, urls[0])
+                        raw_completed = LANGS[lang]["deal_completed_menu"].format(
+                            icon="✅",
+                            id=offer_id,
+                            gifts_list=gifts_list,
+                            receiver=receiver_username,
+                            price=price,
+                            curr=curr_display
+                        )
+                        completed_text = apply_user_bold(off_owner_id, raw_completed)
+                        asyncio.create_task(
+                            _safe_edit_completed_card(
+                                event.bot, event.chat.id, card_msg_id, conn_id, completed_text, preview
+                            )
+                        )
+
+        return await handler(event, data)
+
+
+async def _safe_edit_completed_card(bot: Bot, chat_id: int, msg_id: int, conn_id: str, text: str, preview: LinkPreviewOptions):
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=msg_id,
+            business_connection_id=conn_id,
+            text=text,
+            reply_markup=None,
+            link_preview_options=preview
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось обновить карточку: {e}")
+
+
+async def smart_reply(message: Message, text: str, reply_markup=None):
+    try:
+        if message.business_connection_id:
+            return await message.bot.send_message(
+                chat_id=message.chat.id,
+                text=text,
+                business_connection_id=message.business_connection_id,
+                reply_markup=reply_markup
+            )
+        return await message.reply(text, reply_markup=reply_markup)
+    except Exception as e:
+        logging.warning(f"Ошибка ответа: {e}")
+
+
+async def send_dm_event_notification(bot: Bot, owner_id: int, text: str):
+    try:
+        await bot.send_message(
+            chat_id=owner_id,
+            text=text,
+            link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить уведомление в ЛС: {e}")
+
+
+# ================= СТАТИСТИКА И ТОП =================
+def get_top_buyers_data(hours: int | None = None, only_today: bool = False, limit: int = 10) -> list:
+    with sqlite3.connect(DB_NAME) as conn:
+        rows = conn.execute(
+            "SELECT owner_id, nft_url, price, currency, created_at FROM offers WHERE status = 'completed'"
+        ).fetchall()
+
+    if only_today:
+        cutoff = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    elif hours:
+        cutoff = datetime.now() - timedelta(hours=hours)
+    else:
+        cutoff = None
+
+    buyers = {}
+    for owner_id, nft_url, price_raw, currency_raw, created_at_val in rows:
+        if not owner_id:
+            continue
+        if cutoff and created_at_val:
+            try:
+                c_date = datetime.fromisoformat(str(created_at_val).replace("Z", "").replace(" ", "T").strip())
+                if c_date < cutoff:
+                    continue
+            except Exception:
+                pass
+
+        try:
+            price = float(str(price_raw).replace(",", ".").strip())
+        except (ValueError, TypeError):
+            price = 0.0
+
+        nfts_count = len(nft_url.split(",")) if nft_url else 1
+        curr_key = render_currency(currency_raw or "star")
+
+        if owner_id not in buyers:
+            buyers[owner_id] = {
+                "owner_id": owner_id,
+                "deals": 0,
+                "nfts": 0,
+                "spent": 0.0,
+                "curr": curr_key
+            }
+        buyers[owner_id]["deals"] += 1
+        buyers[owner_id]["nfts"] += nfts_count
+        buyers[owner_id]["spent"] += price
+
+    sorted_buyers = sorted(buyers.values(), key=lambda x: (x["deals"], x["spent"]), reverse=True)
+    return sorted_buyers[:limit]
+
+
+def calculate_today_stats() -> dict:
+    with sqlite3.connect(DB_NAME) as conn:
+        rows = conn.execute("SELECT status, price, currency, nft_url, created_at FROM offers").fetchall()
+
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    total_created = 0
+    completed_count = 0
+    declined_count = 0
+    expired_count = 0
+    total_nfts_received = 0
+    volumes = {"⭐": 0.0, "💎 GRAM": 0.0, "USDT": 0.0}
+
+    for status, price_raw, currency_raw, nft_url, created_at_val in rows:
+        if created_at_val:
+            try:
+                c_date = datetime.fromisoformat(str(created_at_val).replace("Z", "").replace(" ", "T").strip())
+                if c_date < today_start:
+                    continue
+            except Exception:
+                pass
+
+        total_created += 1
+        try:
+            price = float(str(price_raw).replace(",", ".").strip())
+        except (ValueError, TypeError):
+            price = 0.0
+
+        if status == "completed":
+            completed_count += 1
+            curr_key = render_currency(currency_raw or "star")
+            volumes[curr_key] = volumes.get(curr_key, 0.0) + price
+            if nft_url:
+                total_nfts_received += len(nft_url.split(","))
+        elif status == "declined":
+            declined_count += 1
+        elif status == "expired":
+            expired_count += 1
+
+    conversion = round((completed_count / total_created) * 100, 1) if total_created > 0 else 0.0
+
+    return {
+        "total": total_created,
+        "completed": completed_count,
+        "declined": declined_count,
+        "expired": expired_count,
+        "nfts": total_nfts_received,
+        "conversion": conversion,
+        "volumes": volumes
+    }
+
+
+# ================= ПРОВЕРКА ПОДАРКОВ =================
+async def verify_all_gifts_received(nft_urls: List[str], expected_username: str, gift_received_flag: int = 0) -> tuple[bool, List[str]]:
+    if gift_received_flag == 1:
+        return True, []
+
+    clean_user = expected_username.replace("@", "").strip().lower()
+    if not clean_user:
+        return False, [parse_nft_name(u) for u in nft_urls]
+
+    missing = []
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    async with aiohttp.ClientSession(headers=headers) as session:
+        for url in nft_urls:
+            found = False
+            try:
+                async with session.get(url, timeout=8) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        patterns = [
+                            rf'href="https?://t\.me/{re.escape(clean_user)}"',
+                            rf'@{re.escape(clean_user)}\b',
+                            rf'Owner.*?\b{re.escape(clean_user)}\b',
+                            rf'Владелец.*?\b{re.escape(clean_user)}\b'
+                        ]
+                        for pat in patterns:
+                            if re.search(pat, html, re.IGNORECASE | re.DOTALL):
+                                found = True
+                                break
+            except Exception:
+                pass
+            if not found:
+                missing.append(parse_nft_name(url))
+
+    return len(missing) == 0, missing
+
+
+# ================= ФОРМИРОВАНИЕ КАРТОЧКИ =================
+def get_remaining_time(created_at_str: str) -> str:
+    if not created_at_str:
+        return "5h 59m"
+    created_at = datetime.fromisoformat(created_at_str)
+    expires_at = created_at + timedelta(hours=OFFER_DURATION_HOURS)
+    remaining = expires_at - datetime.now()
+    if remaining.total_seconds() <= 0:
+        return "0h 0m"
+    hours = int(remaining.total_seconds() // 3600)
+    minutes = int((remaining.total_seconds() % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
+
+def render_currency(currency_raw: str) -> str:
+    if not currency_raw:
+        return "⭐"
+    curr = str(currency_raw).lower().strip()
+    if any(k in curr for k in ["star", "звезд", "⭐", "xtr"]):
+        return "⭐"
+    elif any(k in curr for k in ["gram", "грам", "ton", "тон", "💎"]):
+        return "💎 GRAM"
+    elif any(k in curr for k in ["usdt", "usd", "$"]):
+        return "USDT"
+    return "⭐"
+
+
+def build_offer_card_text(
+    owner_id: int,
+    receiver_username: str,
+    urls: List[str],
+    price: float | int,
+    currency_raw: str,
+    lang: str,
+    created_at_str: str
+) -> str:
+    t = LANGS.get(lang, LANGS["ru"])
+    st = get_user_style(owner_id)
+    tpl = st.get("template", "default")
+
+    if float(price).is_integer():
+        price = int(price)
+
+    curr_display = render_currency(currency_raw)
+    rem_time = get_remaining_time(created_at_str)
+    gifts_list = render_gifts_list_html(urls)
+
+    if tpl == "original":
+        for_word = t["for_gifts"] if len(urls) > 1 else t["for_gift"]
+        if lang == "en":
+            base_text = (
+                f"User (<a href='https://t.me/{receiver_username}'>@{receiver_username}</a>) "
+                f"offers you {price} {curr_display} {for_word} {gifts_list}\n\n"
+                f"{t['offers_left']}: {rem_time}"
+            )
+        else:
+            base_text = (
+                f"Пользователь (<a href='https://t.me/{receiver_username}'>@{receiver_username}</a>) "
+                f"предлагает вам {price} {curr_display} {for_word} {gifts_list}\n\n"
+                f"{t['offers_left']}: {rem_time}"
+            )
+    else:
+        if len(urls) == 1:
+            base_text = (
+                f"{t['offer_header']} <a href='https://t.me/{receiver_username}'>@{receiver_username}</a>\n"
+                f"<b>{price} {curr_display}</b> {t['for_gift']}\n"
+                f"{gifts_list}\n\n"
+                f"{t['offers_left']}: <b>{rem_time}</b>"
+            )
+        else:
+            base_text = (
+                f"{t['offer_header']} <a href='https://t.me/{receiver_username}'>@{receiver_username}</a>\n"
+                f"<b>{price} {curr_display}</b> {t['for_gifts']}:\n"
+                f"{gifts_list}\n\n"
+                f"{t['offers_left']}: <b>{rem_time}</b>"
+            )
+
+    return apply_user_bold(owner_id, base_text)
+
+
+def build_offer_preview_options(owner_id: int, first_url: str) -> LinkPreviewOptions:
+    st = get_user_style(owner_id)
+    if st["preview"] == "0":
+        return LinkPreviewOptions(is_disabled=True)
+    return LinkPreviewOptions(
+        is_disabled=False,
+        url=first_url,
+        prefer_large_media=True,
+        show_above_text=(st["pos"] == "up")
+    )
+
+
+def get_offer_keyboard(offer_id: int, lang: str, owner_id: int = 0) -> InlineKeyboardMarkup:
+    t = LANGS.get(lang, LANGS["ru"])
+    st = get_user_style(owner_id) if owner_id else {
+        "layout": "row", "icons": "0", "custom_accept": "", "custom_decline": ""
+    }
+
+    use_icons = (st["icons"] == "1")
+    base_acc = st.get("custom_accept") or t["accept_word"]
+    base_dec = st.get("custom_decline") or t["decline_word"]
+
+    dec_label = f"❌ {base_dec}" if use_icons else base_dec
+    acc_label = f"✅ {base_acc}" if use_icons else base_acc
+
+    btn_dec = InlineKeyboardButton(text=dec_label, callback_data=f"offer_decline:{offer_id}:{lang}")
+    btn_acc = InlineKeyboardButton(text=acc_label, callback_data=f"offer_accept:{offer_id}:{lang}")
+
+    if st["layout"] == "col":
+        return InlineKeyboardMarkup(inline_keyboard=[[btn_acc], [btn_dec]])
+    return InlineKeyboardMarkup(inline_keyboard=[[btn_dec, btn_acc]])
+
+
+def get_confirm_keyboard(offer_id: int, lang: str) -> InlineKeyboardMarkup:
+    t = LANGS.get(lang, LANGS["ru"])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ {t['confirm_word']}", callback_data=f"offer_confirm:{offer_id}:{lang}")],
+        [InlineKeyboardButton(text=t["back"], callback_data=f"offer_back:{offer_id}:{lang}")]
+    ])
+
+
+def get_transfer_keyboard(offer_id: int, lang: str, receiver_username: str) -> InlineKeyboardMarkup:
+    t = LANGS.get(lang, LANGS["ru"])
+    target_url = f"tg://send_gift?to={receiver_username}"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{t['transfer_btn']}{receiver_username}", url=target_url)],
+        [InlineKeyboardButton(text=f"✅ {t['i_sent_btn']}", callback_data=f"verify_gift:{offer_id}:{lang}")],
+        [InlineKeyboardButton(text=t["how_to"], callback_data=f"how_to_transfer:{lang}:{receiver_username}")]
+    ])
+
+
+def build_webapp_keyboard(user: User) -> ReplyKeyboardMarkup:
+    lang_code = get_user_lang(user.id)
+    receiver = get_user_receiver(user.id, user.username)
+    default_cid = get_owner_default_conn_id(user.id)
+    chats_b64 = get_owner_chats_encoded(user.id)
+    st = get_user_style(user.id)
+    webapp_full_url = (
+        f"{WEBAPP_URL}?v={int(time.time())}&receiver={quote(receiver)}&lang={lang_code}"
+        f"&dcid={quote(default_cid)}&chats={chats_b64}"
+        f"&sprev={st['preview']}&slay={st['layout']}&sico={st['icons']}&spos={st['pos']}"
+        f"&stpl={st['template']}&sbold={st['bold']}"
+        f"&sacc={quote(st['custom_accept'])}&sdec={quote(st['custom_decline'])}"
+    )
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Панель управления", web_app=WebAppInfo(url=webapp_full_url))]],
+        resize_keyboard=True
+    )
+
+
+async def send_offer_log_to_bot_dm(bot: Bot, owner_user: User, target_display: str, from_username: str, price: float | int, currency_raw: str, urls: List[str]):
+    fmt_price = int(price) if float(price).is_integer() else price
+    gifts_list = render_gifts_list_html(urls)
+    log_text = (
+        f"📤 <b>Вы отправили оффер (на 6 часов)</b>\n\n"
+        f"👤 <b>Продавец (кому):</b> {target_display}\n"
+        f"📨 <b>Покупатель (от кого):</b> @{from_username}\n"
+        f"💰 <b>Цена:</b> {fmt_price} {currency_raw.upper()}\n\n"
+        f"🎁 <b>Подарок:</b>\n{gifts_list}"
+    )
+    try:
+        await bot.send_message(
+            chat_id=owner_user.id,
+            text=log_text,
+            reply_markup=build_webapp_keyboard(owner_user),
+            link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+    except Exception as e:
+        logging.warning(f"Не удалось отправить лог в ЛС: {e}")
+
+
+# ================= ПРЯМАЯ ОТПРАВКА С АЛЕРТОМ =================
+async def send_offer_card_to_chat(
+    bot: Bot,
+    chat_id: int,
+    conn_id: str,
+    owner_id: int,
+    receiver_username: str,
+    urls: List[str],
+    price: float | int,
+    currency_raw: str,
+    lang: str
+) -> int:
+    if float(price).is_integer():
+        price = int(price)
+
+    created_at_iso = datetime.now().isoformat()
+    offer_id = create_offer(chat_id, 0, conn_id, owner_id, urls, price, currency_raw, created_at_iso)
+
+    text_card = build_offer_card_text(owner_id, receiver_username, urls, price, currency_raw, lang, created_at_iso)
+    preview = build_offer_preview_options(owner_id, urls[0])
+    kb = get_offer_keyboard(offer_id, lang, owner_id)
+
+    try:
+        sent_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=text_card,
+            business_connection_id=conn_id,
+            reply_markup=kb,
+            link_preview_options=preview
+        )
+        update_offer_message_id(offer_id, sent_msg.message_id)
+        return offer_id
+    except Exception as e1:
+        logging.warning(f"Прямая отправка с превью не прошла: {e1}. Пробуем без превью...")
+
+    try:
+        sent_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=text_card,
+            business_connection_id=conn_id,
+            reply_markup=kb,
+            link_preview_options=LinkPreviewOptions(is_disabled=True)
+        )
+        update_offer_message_id(offer_id, sent_msg.message_id)
+        return offer_id
+    except Exception as e2:
+        error_details = str(e2)
+        logging.error(f"Критический сбой доставки карточки #{offer_id}: {error_details}")
+
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.execute("UPDATE offers SET status = 'failed' WHERE id = ?", (offer_id,))
+            conn.commit()
+
+        chat_disp = get_seller_display(chat_id)
+        fail_text = (
+            "🚨 <b>Оффер не был доставлен получателю!</b>\n\n"
+            f"👤 <b>Собеседник:</b> {chat_disp}\n"
+            f"💰 <b>Сумма:</b> {price} {render_currency(currency_raw)}\n"
+            f"⚠️ <b>Причина Telegram:</b> <code>{error_details}</code>\n\n"
+            "💡 <b>Рекомендация:</b>\n"
+            "• Убедитесь, что вы отправляете оффер в <b>личные сообщения человеку</b>, а не в группу или канал.\n"
+            "• Напишите собеседнику обычное текстовое сообщение вручную для активации диалога.\n"
+            "• Проверьте статус подключения в Telegram Business."
+        )
+        try:
+            await bot.send_message(
+                chat_id=owner_id,
+                text=fail_text,
+                reply_markup=build_webapp_keyboard(await bot.get_chat(owner_id))
+            )
+        except Exception:
+            pass
+
+        return 0
+
+
+# ================= ВОРКЕР ТАЙМЕРА (6 ЧАСОВ) =================
+async def offer_expiration_worker(bot: Bot):
+    while True:
+        await asyncio.sleep(25)
+        try:
+            with sqlite3.connect(DB_NAME) as conn:
+                cursor = conn.cursor()
+                cursor.execute("""
+                    SELECT id, chat_id, message_id, business_connection_id, owner_id, nft_url, price, currency, created_at, last_checkpoint
+                    FROM offers WHERE status = 'active'
+                """)
+                active_offers = cursor.fetchall()
+
+            now = datetime.now()
+            for row in active_offers:
+                offer_id, chat_id, message_id, conn_id, owner_id, nft_url_str, price, currency_raw, created_at_str, last_cp = row
+                if not created_at_str or not message_id:
+                    continue
+
+                created_at = datetime.fromisoformat(created_at_str)
+                rem_seconds = (timedelta(hours=OFFER_DURATION_HOURS) - (now - created_at)).total_seconds()
+                lang = get_user_lang(owner_id)
+
+                if rem_seconds <= 0:
+                    with sqlite3.connect(DB_NAME) as conn:
+                        conn.execute("UPDATE offers SET status = 'expired' WHERE id = ?", (offer_id,))
+                        conn.commit()
+                    try:
+                        exp_text = apply_user_bold(owner_id, LANGS.get(lang, LANGS["ru"])["expired_text"])
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            business_connection_id=conn_id,
+                            text=exp_text,
+                            reply_markup=None,
+                            link_preview_options=LinkPreviewOptions(is_disabled=True)
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.35)
+                    continue
+
+                rem_minutes = int(rem_seconds // 60)
+                last_cp = last_cp or 360
+                triggered_cp = None
+
+                for cp in SILENT_EDIT_CHECKPOINTS:
+                    if rem_minutes <= cp < last_cp:
+                        triggered_cp = cp
+                        break
+
+                if triggered_cp is not None:
+                    with sqlite3.connect(DB_NAME) as conn:
+                        conn.execute("UPDATE offers SET last_checkpoint = ? WHERE id = ?", (triggered_cp, offer_id))
+                        conn.commit()
+
+                    receiver_username = get_user_receiver(owner_id)
+                    if not receiver_username:
+                        continue
+
+                    urls = nft_url_str.split(",")
+                    updated_text = build_offer_card_text(owner_id, receiver_username, urls, price, currency_raw, lang, created_at_str)
+                    preview = build_offer_preview_options(owner_id, urls[0])
+                    kb = get_offer_keyboard(offer_id, lang, owner_id)
+
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            business_connection_id=conn_id,
+                            text=updated_text,
+                            reply_markup=kb,
+                            link_preview_options=preview
+                        )
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.35)
+        except Exception as e:
+            logging.error(f"Ошибка воркера таймеров: {e}")
+
+
+# ================= ГЛАВНОЕ МЕНЮ И СТАРТ =================
+async def send_main_control_panel(target_msg: Message, user: User):
+    lang_code = get_user_lang(user.id)
+    receiver = get_user_receiver(user.id, user.username)
+    sub_status = "Активна" if has_active_subscription(user) else "Не активна"
+    rec_line = f"Получатель: <b>@{receiver}</b>" if receiver else f"Получатель: <b>⚠️ Не установлен!</b>\n\n{NO_USERNAME_WARNING_RU}"
+
+    text = (
+        f"<b>Панель управления офферами</b>\n\n"
+        f"🆔 Ваш ID: <code>{user.id}</code>\n"
+        f"{rec_line}\n"
+        f"🌐 Язык: <b>{lang_code.upper()}</b>\n"
+        f"⏳ Срок офферов: <b>{OFFER_DURATION_HOURS} часов</b>\n"
+        f"💎 Подписка: <b>{sub_status}</b>\n\n"
+        f"<code>/tempagifts</code> — активировать тестовый доступ (30 дней)\n"
+        f"<code>/setreceiver @username</code> — изменить юзернейм получателя"
+    )
+    await target_msg.answer(text, reply_markup=build_webapp_keyboard(user))
+
+
+@router.message(Command("start"))
+async def cmd_start(message: Message, bot: Bot):
+    user = message.from_user
+    save_user_profile(user)
+
+    if not await check_user_subscription(bot, user.id):
+        await message.answer(
+            f"⚠️ <b>Доступ ограничен!</b>\n\n"
+            f"Для работы с ботом необходимо подписаться на наш канал <b>{REQUIRED_CHANNEL}</b>.",
+            reply_markup=get_sub_check_keyboard()
+        )
+        return
+
+    await send_main_control_panel(message, user)
+
+
+@router.callback_query(F.data == "check_subscription_btn")
+async def cb_check_sub(call: CallbackQuery, bot: Bot):
+    user = call.from_user
+    save_user_profile(user)
+    is_sub = await check_user_subscription(bot, user.id)
+    if not is_sub:
+        await call.answer(f"❌ Вы еще не подписались на {REQUIRED_CHANNEL}!", show_alert=True)
+        return
+
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
+    await call.answer("✅ Подписка подтверждена!", show_alert=True)
+    await send_main_control_panel(call.message, user)
+
+
+# ================= БАЗА ПОЛЬЗОВАТЕЛЕЙ (/users) =================
+def get_users_page_data(page: int = 1) -> tuple[list, int, int]:
+    offset = (page - 1) * PAGE_SIZE
+    with sqlite3.connect(DB_NAME) as conn:
+        total_count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        rows = conn.execute("""
+            SELECT 
+                u.user_id, 
+                u.username, 
+                u.full_name, 
+                u.joined_at,
+                s.expires_at
+            FROM users u
+            LEFT JOIN subscriptions s ON u.user_id = s.user_id
+            ORDER BY u.joined_at DESC
+            LIMIT ? OFFSET ?
+        """, (PAGE_SIZE, offset)).fetchall()
+
+    total_pages = max(1, (total_count + PAGE_SIZE - 1) // PAGE_SIZE)
+    return rows, total_count, total_pages
+
+
+def build_users_page_message(page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
+    rows, total_count, total_pages = get_users_page_data(page)
+
+    lines = [
+        f"👥 <b>База пользователей</b> (Всего: <code>{total_count}</code>)",
+        f"<i>Страница {page} из {total_pages}</i>\n"
+    ]
+
+    now = datetime.now()
+    if not rows:
+        lines.append("<i>В базе пока нет пользователей.</i>")
+    else:
+        for idx, (u_id, uname, fname, joined, exp_at) in enumerate(rows, start=(page - 1) * PAGE_SIZE + 1):
+            u_title = f"@{uname}" if uname else "<i>Без юзернейма</i>"
+            name_part = f" ({fname})" if fname else ""
+            date_clean = joined[:16].replace("T", " ") if joined else "—"
+
+            if exp_at and datetime.fromisoformat(exp_at) > now:
+                exp_date_str = exp_at[:16].replace("T", " ")
+                sub_str = f"Активна (до {exp_date_str}) ✅"
+            else:
+                sub_str = "Нет ❌"
+
+            lines.append(
+                f"<b>{idx}. 👤 {u_title}</b>{name_part}\n"
+                f"   ├ 🆔 TG: <code>{u_id}</code>\n"
+                f"   ├ 💎 Подписка: <b>{sub_str}</b>\n"
+                f"   └ 📅 Регистрация: {date_clean}\n"
+            )
+
+    nav_buttons = []
+    if page > 1:
+        nav_buttons.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"users_page:{page - 1}"))
+    nav_buttons.append(InlineKeyboardButton(text=f"{page} / {total_pages}", callback_data="users_noop"))
+    if page < total_pages:
+        nav_buttons.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"users_page:{page + 1}"))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        nav_buttons,
+        [InlineKeyboardButton(text="📥 Скачать базу (.csv таблица)", callback_data="users_download_csv")]
+    ])
+
+    return "\n".join(lines), kb
+
+
+@router.message(Command("users"))
+async def cmd_users(message: Message):
+    if not is_admin(message.from_user):
+        return
+    text, kb = build_users_page_message(page=1)
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("users_page:"))
+async def cb_users_page(call: CallbackQuery):
+    if not is_admin(call.from_user):
+        await call.answer("Доступно только администратору", show_alert=True)
+        return
+    page = int(call.data.split(":")[1])
+    text, kb = build_users_page_message(page=page)
+    try:
+        await call.message.edit_text(text=text, reply_markup=kb)
+    except Exception:
+        pass
+    await call.answer()
+
+
+@router.callback_query(F.data == "users_noop")
+async def cb_users_noop(call: CallbackQuery):
+    await call.answer()
+
+
+@router.callback_query(F.data == "users_download_csv")
+async def cb_users_download_csv(call: CallbackQuery):
+    if not is_admin(call.from_user):
+        return
+
+    now = datetime.now()
+    with sqlite3.connect(DB_NAME) as conn:
+        rows = conn.execute("""
+            SELECT 
+                u.user_id, 
+                u.username, 
+                u.full_name, 
+                u.joined_at,
+                s.expires_at
+            FROM users u
+            LEFT JOIN subscriptions s ON u.user_id = s.user_id
+            ORDER BY u.joined_at DESC
+        """).fetchall()
+
+    csv_lines = ["Telegram ID,Username,Full Name,Joined Date,Has Active Sub,Subscription Expiry"]
+    for r in rows:
+        u_id, uname, fname, joined, exp_at = r
+        clean_fname = (fname or "").replace(",", " ").replace('"', '')
+        has_sub = "YES" if (exp_at and datetime.fromisoformat(exp_at) > now) else "NO"
+        csv_lines.append(
+            f'"{u_id}","{uname or ""}","{clean_fname}","{joined or ""}","{has_sub}","{exp_at or ""}"'
+        )
+
+    csv_data = "\ufeff" + "\n".join(csv_lines)
+    file_bytes = csv_data.encode("utf-8")
+    doc = BufferedInputFile(file_bytes, filename=f"users_{datetime.now().strftime('%d_%m_%Y')}.csv")
+
+    await call.message.answer_document(doc, caption=f"📊 Полная база пользователей: <b>{len(rows)} чел.</b>")
+    await call.answer()
+
+
+# ================= АДМИН-КОМАНДЫ (/stats, /top, /broadcast) =================
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user):
+        return
+
+    save_user_profile(message.from_user)
+    st = calculate_today_stats()
+    today_str = datetime.now().strftime("%d.%m.%Y")
+
+    vol_lines = []
+    star_val = st["volumes"].get("⭐", 0.0)
+    fmt_star = int(star_val) if float(star_val).is_integer() else round(star_val, 2)
+    vol_lines.append(f"• <b>{fmt_star} ⭐</b>")
+
+    for curr_label, amount in st["volumes"].items():
+        if curr_label != "⭐" and amount > 0:
+            fmt_amt = int(amount) if float(amount).is_integer() else round(amount, 2)
+            vol_lines.append(f"• <b>{fmt_amt} {curr_label}</b>")
+    vol_str = "\n".join(vol_lines)
+
+    top_today = get_top_buyers_data(only_today=True, limit=3)
+    top_lines = []
+    medals = ["🥇", "🥈", "🥉"]
+    for idx, t in enumerate(top_today):
+        b_disp = get_buyer_display(t["owner_id"])
+        top_lines.append(f"{medals[idx]} {b_disp} — <b>{t['deals']} сд.</b> ({t['nfts']} NFT)")
+    top_str = "\n".join(top_lines) if top_lines else "Нет сделок"
+
+    text = (
+        f"📊 <b>Статистика выкупа за сегодня ({today_str})</b>\n\n"
+        f"✅ Успешных выкупов: <b>{st['completed']}</b>\n"
+        f"🎁 Куплено подарков: <b>{st['nfts']} шт.</b>\n"
+        f"📈 Конверсия: <b>{st['conversion']}%</b>\n"
+        f"📤 Всего отправлено: <code>{st['total']}</code>\n"
+        f"❌ Отклонено: <code>{st['declined']}</code> | ⏳ Истекло: <code>{st['expired']}</code>\n\n"
+        f"💰 <b>Выплачено:</b>\n{vol_str}\n\n"
+        f"🏆 <b>Топ покупателей за сегодня:</b>\n{top_str}"
+    )
+    await message.answer(text)
+
+
+@router.message(Command("top"))
+async def cmd_top_buyers(message: Message, command: CommandObject):
+    if not is_admin(message.from_user):
+        return
+
+    save_user_profile(message.from_user)
+    arg = (command.args or "").strip().lower()
+
+    if arg in ["today", "сегодня", "day"]:
+        hours = None
+        only_today = True
+        label = "за сегодня"
+    elif arg in ["1h", "1"]:
+        hours = 1
+        only_today = False
+        label = "за 1 час"
+    elif arg in ["24h", "24", "1d"]:
+        hours = 24
+        only_today = False
+        label = "за 24 часа"
+    else:
+        hours = None
+        only_today = False
+        label = "за все время"
+
+    top_list = get_top_buyers_data(hours=hours, only_today=only_today, limit=10)
+    if not top_list:
+        await message.answer(f"🏆 <b>Топ покупателей ({label}) пуст:</b> нет закрытых сделок.")
+        return
+
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+    text_lines = [f"🏆 <b>Топ-10 покупателей NFT ({label}):</b>\n"]
+
+    for idx, t in enumerate(top_list):
+        medal = medals[idx] if idx < len(medals) else f"<b>{idx+1}.</b>"
+        clean_user = get_buyer_display(t["owner_id"])
+        fmt_spent = int(t["spent"]) if float(t["spent"]).is_integer() else round(t["spent"], 2)
+        text_lines.append(
+            f"{medal} <b>{clean_user}</b>\n"
+            f" └ Куплено: <b>{t['nfts']} NFT</b> | Покупок: <b>{t['deals']}</b> | Выплачено: <b>{fmt_spent} {t['curr']}</b>\n"
+        )
+
+    await message.answer("\n".join(text_lines))
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, command: CommandObject, bot: Bot):
+    if not is_admin(message.from_user):
+        return
+
+    text_to_send = command.args
+    if not text_to_send:
+        await message.answer("❌ Формат: <code>/broadcast Ваш текст рассылки</code>")
+        return
+
+    with sqlite3.connect(DB_NAME) as conn:
+        user_ids = [row[0] for row in conn.execute("SELECT user_id FROM users").fetchall()]
+
+    if not user_ids:
+        await message.answer("❌ База пользователей пуста.")
+        return
+
+    status_msg = await message.answer(f"⏳ Начинаю рассылку для <b>{len(user_ids)}</b> пользователей...")
+    success, failed = 0, 0
+
+    for uid in user_ids:
+        try:
+            await bot.send_message(
+                chat_id=uid,
+                text=text_to_send,
+                link_preview_options=LinkPreviewOptions(is_disabled=True)
+            )
+            success += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+
+    await status_msg.edit_text(
+        f"📢 <b>Рассылка завершена!</b>\n\n"
+        f"✅ Успешно доставлено: <b>{success}</b>\n"
+        f"❌ Не доставлено: <b>{failed}</b>\n"
+        f"👥 Всего в базе: <b>{len(user_ids)}</b>"
+    )
+
+
+# ================= MINI APP И СОЗДАНИЕ ОФФЕРОВ =================
+@router.message(F.web_app_data)
+async def handle_webapp_data(message: Message, bot: Bot):
+    user = message.from_user
+    save_user_profile(user)
+    try:
+        data = json.loads(message.web_app_data.data)
+        action = data.get("action")
+
+        if "style_preview" in data:
+            save_user_style(
+                user.id,
+                str(data.get("style_preview", "1")),
+                str(data.get("style_layout", "row")),
+                str(data.get("style_icons", "0")),
+                str(data.get("style_pos", "down")),
+                str(data.get("style_template", "default")),
+                str(data.get("style_bold", "0")),
+                str(data.get("custom_accept", "")),
+                str(data.get("custom_decline", ""))
+            )
+
+        if action == "save_settings":
+            new_receiver = data.get("receiver", "").replace("@", "").strip()
+            new_lang = data.get("lang", "ru")
+            if new_lang in ["ru", "en"]:
+                set_user_lang(user.id, new_lang)
+            if not new_receiver:
+                await message.answer(NO_USERNAME_WARNING_RU, reply_markup=build_webapp_keyboard(user))
+                return
+            set_user_receiver(user.id, new_receiver)
+            await message.answer(
+                f"✅ <b>Настройки и кастомизация сохранены!</b>\n"
+                f"Получатель подарков: <b>@{new_receiver}</b>",
+                reply_markup=build_webapp_keyboard(user)
+            )
+
+        elif action == "send_offer":
+            if not await check_user_subscription(bot, user.id):
+                await message.answer(
+                    f"⚠️ <b>Для отправки офферов требуется подписка на канал {REQUIRED_CHANNEL}!</b>",
+                    reply_markup=get_sub_check_keyboard()
+                )
+                return
+
+            if not has_active_subscription(user):
+                await message.answer("У вас нет активной подписки. Введите <code>/tempagifts</code>.")
+                return
+
+            raw_target = str(data.get("chat_id", "")).strip()
+            conn_id = (data.get("conn_id") or "").strip() or get_owner_default_conn_id(user.id)
+            urls = extract_all_nft_urls(data.get("nft_urls") or data.get("nft_url") or "")
+
+            price = float(data.get("price", 0))
+            currency = data.get("currency", "star")
+            lang = data.get("lang") or get_user_lang(user.id)
+            receiver = (data.get("receiver") or "").replace("@", "").strip() or get_user_receiver(user.id, user.username)
+
+            if not receiver:
+                await message.answer(NO_USERNAME_WARNING_RU, reply_markup=build_webapp_keyboard(user))
+                return
+            if not urls:
+                await message.answer("❌ Не удалось распознать ссылку на подарок.")
+                return
+            if not conn_id:
+                await message.answer("❌ Подключите бота в настройках Telegram Business.")
+                return
+
+            # Проверка получателя
+            if raw_target.startswith("@") or not raw_target.lstrip("-").isdigit():
+                clean_uname = raw_target.replace("@", "").strip().lower()
+                with sqlite3.connect(DB_NAME) as conn:
+                    row = conn.execute(
+                        "SELECT chat_id, connection_id, title, username FROM business_chats WHERE owner_id = ? AND LOWER(username) = ? LIMIT 1",
+                        (user.id, clean_uname)
+                    ).fetchone()
+                if row:
+                    chat_id = int(row[0])
+                    conn_id = row[1] or conn_id
+                    target_display = f"@{row[3]}" if row[3] else f"{row[2]}"
+                else:
+                    try:
+                        chat_obj = await bot.get_chat(f"@{clean_uname}")
+                    except Exception as e:
+                        await message.answer(f"❌ Пользователь @{clean_uname} не найден: {e}")
+                        return
+
+                    # Защита от отправки в группы и каналы
+                    if chat_obj.type != "private":
+                        await message.answer(
+                            f"❌ <b>Ошибка чата!</b>\n\n"
+                            f"<code>@{clean_uname}</code> является каналом или группой.\n"
+                            f"Бизнес-офферы можно отправлять только в <b>личные сообщения пользователям</b>."
+                        )
+                        return
+
+                    chat_id = chat_obj.id
+                    full_name = " ".join(filter(None, [chat_obj.first_name, chat_obj.last_name])) or f"@{clean_uname}"
+                    save_business_chat(chat_id, user.id, conn_id, full_name, clean_uname)
+                    target_display = f"@{clean_uname}"
+            else:
+                chat_id = int(raw_target)
+                target_display = get_seller_display(chat_id)
+
+            await send_offer_card_to_chat(bot, chat_id, conn_id, user.id, receiver, urls, price, currency, lang)
+            await send_offer_log_to_bot_dm(bot, user, target_display, receiver, price, currency, urls)
+
+    except Exception as e:
+        logging.error(f"Ошибка WebApp: {e}")
+        await message.answer(f"❌ Ошибка отправки оффера: {e}")
+
+
+@router.business_message(F.text.regexp(r"(?is)^!создать\s+(.+)"))
+async def handle_create_offer(message: Message, bot: Bot):
+    conn_id = message.business_connection_id
+    owner = message.from_user
+    save_user_profile(owner)
+    lang = get_user_lang(owner.id)
+
+    if not await check_user_subscription(bot, owner.id):
+        await smart_reply(message, f"⚠️ Для создания офферов требуется подписка на канал {REQUIRED_CHANNEL}!")
+        return
+
+    if not has_active_subscription(owner):
+        await smart_reply(message, LANGS[lang]["no_sub"])
+        return
+
+    receiver_username = get_user_receiver(owner.id, owner.username)
+    if not receiver_username:
+        await smart_reply(message, NO_USERNAME_WARNING_RU)
+        return
+
+    body = re.sub(r"(?i)^!создать\s+", "", message.text.strip()).strip()
+    tail_match = re.search(r"(\d+(?:[.,]\d+)?)\s+([a-zA-Zа-яА-Я⭐💎$]+)\s*$", body)
+
+    if not tail_match:
+        await smart_reply(message, "❌ Формат: <code>!создать ссылка 500 star</code>")
+        return
+
+    price = float(tail_match.group(1).replace(",", "."))
+    currency_raw = tail_match.group(2)
+    links_part = body[:tail_match.start()].strip()
+
+    urls = extract_all_nft_urls(links_part)
+    if not urls:
+        await smart_reply(message, "❌ Ссылка не найдена. Пример: <code>!создать t.me/nft/DurovsCap-1 500 star</code>")
+        return
+
+    try:
+        try:
+            await bot.delete_business_messages(business_connection_id=conn_id, message_ids=[message.message_id])
+        except Exception:
+            pass
+
+        await send_offer_card_to_chat(bot, message.chat.id, conn_id, owner.id, receiver_username, urls, price, currency_raw, lang)
+
+        target_display = f"@{message.chat.username}" if message.chat.username else get_seller_display(message.chat.id)
+        await send_offer_log_to_bot_dm(bot, owner, target_display, receiver_username, price, currency_raw, urls)
+    except Exception as e:
+        await smart_reply(message, f"❌ Ошибка: {e}")
+
+
+# ================= КНОПКИ КАРТОЧКИ ОФФЕРА =================
+@router.callback_query(F.data.startswith("offer_accept:"))
+async def cb_accept_offer(call: CallbackQuery, bot: Bot):
+    parts = call.data.split(":")
+    offer_id = int(parts[1])
+    lang = parts[2] if len(parts) > 2 else "ru"
+    t = LANGS[lang]
+
+    offer = get_offer_by_id(offer_id)
+    if not offer or offer[10] != 'active':
+        await call.answer("Оффер неактивен", show_alert=True)
+        return
+
+    owner_id = offer[4]
+    urls = offer[5].split(",")
+    price = int(offer[7]) if float(offer[7]).is_integer() else offer[7]
+    receiver_username = get_user_receiver(owner_id)
+    if not receiver_username:
+        await call.answer("⚠️ У получателя не установлен @username!", show_alert=True)
+        return
+
+    curr_display = render_currency(offer[8])
+    gifts_list = render_gifts_list_html(urls)
+    preview = build_offer_preview_options(owner_id, urls[0])
+
+    raw_text = t["accepted_step2"].format(icon="✅", receiver=receiver_username, gifts_list=gifts_list, price=price, curr=curr_display)
+    text = apply_user_bold(owner_id, raw_text)
+
+    await call.message.edit_text(text=text, reply_markup=get_confirm_keyboard(offer_id, lang), link_preview_options=preview)
+    await call.answer()
+
+    who_accepted = f"@{call.from_user.username}" if call.from_user.username else get_seller_display(call.message.chat.id)
+    accept_notify_text = (
+        f"🟢 <b>Оффер принят продавцом!</b>\n\n"
+        f"👤 <b>Продавец (клиент):</b> {who_accepted}\n"
+        f"💰 <b>Сумма сделки:</b> {price} {curr_display}\n"
+        f"🎁 <b>Лоты:</b>\n{gifts_list}\n\n"
+        f"⏳ <i>Клиент перешел к отправке подарков.</i>"
+    )
+    await send_dm_event_notification(bot, owner_id, accept_notify_text)
+
+
+@router.callback_query(F.data.startswith("offer_confirm:"))
+async def cb_confirm_offer(call: CallbackQuery):
+    parts = call.data.split(":")
+    offer_id = int(parts[1])
+    lang = parts[2] if len(parts) > 2 else "ru"
+    t = LANGS[lang]
+
+    offer = get_offer_by_id(offer_id)
+    if not offer:
+        return
+
+    owner_id = offer[4]
+    urls = offer[5].split(",")
+    price = int(offer[7]) if float(offer[7]).is_integer() else offer[7]
+    receiver_username = get_user_receiver(owner_id)
+    if not receiver_username:
+        await call.answer("⚠️ У получателя не установлен @username!", show_alert=True)
+        return
+
+    curr_display = render_currency(offer[8])
+    gift_link = f"tg://send_gift?to={receiver_username}"
+    gifts_list = render_gifts_list_html(urls)
+    preview = build_offer_preview_options(owner_id, urls[0])
+
+    raw_text = t["sold_text"].format(icon="✅", gifts_list=gifts_list, price=price, curr=curr_display, gift_link=gift_link, receiver=receiver_username)
+    text = apply_user_bold(owner_id, raw_text)
+
+    await call.message.edit_text(text=text, reply_markup=get_transfer_keyboard(offer_id, lang, receiver_username), link_preview_options=preview)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("verify_gift:"))
+async def cb_verify_gift(call: CallbackQuery, bot: Bot):
+    parts = call.data.split(":")
+    offer_id = int(parts[1])
+    lang = parts[2] if len(parts) > 2 else "ru"
+    t = LANGS[lang]
+
+    offer = get_offer_by_id(offer_id)
+    if not offer:
+        return
+
+    owner_id = offer[4]
+    urls = offer[5].split(",")
+    price = int(offer[7]) if float(offer[7]).is_integer() else offer[7]
+    receiver_username = get_user_receiver(owner_id)
+    curr_display = render_currency(offer[8])
+    gift_link = f"tg://send_gift?to={receiver_username}"
+    preview = build_offer_preview_options(owner_id, urls[0])
+
+    if offer[10] == "completed":
+        gifts_list = render_gifts_list_html(urls)
+        raw_completed = t["deal_completed_menu"].format(icon="✅", id=offer_id, gifts_list=gifts_list, receiver=receiver_username, price=price, curr=curr_display)
+        completed_text = apply_user_bold(owner_id, raw_completed)
+        try:
+            await call.message.edit_text(text=completed_text, reply_markup=None, link_preview_options=preview)
+        except Exception:
+            pass
+        await call.answer("Все подарки уже подтверждены! Сделка завершена.", show_alert=True)
+        return
+
+    all_received, missing = await verify_all_gifts_received(urls, receiver_username, offer[11])
+
+    if not all_received:
+        missing_str = "\n".join([f"• <b>{m}</b>" for m in missing])
+        raw_not_sent = t["not_sent_menu"].format(receiver=receiver_username, missing=missing_str, gift_link=gift_link)
+        text = apply_user_bold(owner_id, raw_not_sent)
+        try:
+            await call.message.edit_text(text=text, reply_markup=get_transfer_keyboard(offer_id, lang, receiver_username), link_preview_options=preview)
+        except Exception:
+            pass
+        await call.answer(t["not_sent_alert"].format(missing=", ".join(missing)), show_alert=True)
+        return
+
+    mark_offer_completed(offer_id)
+    gifts_list = render_gifts_list_html(urls)
+    raw_completed = t["deal_completed_menu"].format(icon="✅", id=offer_id, gifts_list=gifts_list, receiver=receiver_username, price=price, curr=curr_display)
+    completed_text = apply_user_bold(owner_id, raw_completed)
+
+    await call.message.edit_text(text=completed_text, reply_markup=None, link_preview_options=preview)
+    await call.answer("Все подарки подтверждены! Сделка завершена.", show_alert=True)
+
+    seller_display = get_seller_display(call.message.chat.id)
+    buyer_display = get_buyer_display(owner_id)
+
+    deal_done_notify = (
+        f"🎉 <b>NFT успешно получены! Сделка закрыта.</b>\n\n"
+        f"Квитанция: <code>#TX-00{offer_id}</code>\n"
+        f"📥 <b>Покупатель:</b> {buyer_display}\n"
+        f"👤 <b>Продавец (клиент):</b> {seller_display}\n"
+        f"💰 <b>Выплачено:</b> {price} {curr_display}\n"
+        f"🎁 <b>Полученные лоты:</b>\n{gifts_list}\n\n"
+        f"📥 <i>Подарки поступили на профиль @{receiver_username}.</i>"
+    )
+    await send_dm_event_notification(bot, owner_id, deal_done_notify)
+
+
+@router.callback_query(F.data.startswith("offer_back:"))
+async def cb_back_offer(call: CallbackQuery):
+    parts = call.data.split(":")
+    offer_id = int(parts[1])
+    lang = parts[2] if len(parts) > 2 else "ru"
+
+    offer = get_offer_by_id(offer_id)
+    if not offer or offer[10] != 'active':
+        await call.answer("Оффер неактивен", show_alert=True)
+        return
+
+    owner_id = offer[4]
+    urls = offer[5].split(",")
+    price = offer[7]
+    currency_raw = offer[8]
+    created_at_str = offer[9]
+    receiver_username = get_user_receiver(owner_id)
+
+    text = build_offer_card_text(owner_id, receiver_username, urls, price, currency_raw, lang, created_at_str)
+    preview = build_offer_preview_options(owner_id, urls[0])
+    kb = get_offer_keyboard(offer_id, lang, owner_id)
+
+    await call.message.edit_text(text=text, reply_markup=kb, link_preview_options=preview)
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("offer_decline:"))
+async def cb_decline_offer(call: CallbackQuery, bot: Bot):
+    parts = call.data.split(":")
+    offer_id = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    lang = parts[2] if len(parts) > 2 else "ru"
+
+    offer = get_offer_by_id(offer_id) if offer_id else None
+    owner_id = offer[4] if offer else 0
+
+    raw_declined = LANGS[lang]["declined"].format(icon="❌")
+    declined_text = apply_user_bold(owner_id, raw_declined)
+
+    await call.message.edit_text(text=declined_text, reply_markup=None, link_preview_options=LinkPreviewOptions(is_disabled=True))
+    await call.answer(LANGS[lang]["declined_alert"], show_alert=True)
+
+    if offer_id and offer:
+        with sqlite3.connect(DB_NAME) as conn:
+            conn.execute("UPDATE offers SET status = 'declined' WHERE id = ?", (offer_id,))
+            conn.commit()
+
+        urls = offer[5].split(",")
+        price = int(offer[7]) if float(offer[7]).is_integer() else offer[7]
+        curr_display = render_currency(offer[8])
+        gifts_list = render_gifts_list_html(urls)
+
+        who_declined = f"@{call.from_user.username}" if call.from_user.username else get_seller_display(call.message.chat.id)
+        decline_notify = (
+            f"❌ <b>Оффер был отклонен!</b>\n\n"
+            f"👤 <b>Продавец (клиент):</b> {who_declined}\n"
+            f"💰 <b>Сумма:</b> {price} {curr_display}\n"
+            f"🎁 <b>Лоты:</b>\n{gifts_list}\n\n"
+            f"⚠️ <i>Собеседник нажал кнопку отмены в чате.</i>"
+        )
+        await send_dm_event_notification(bot, owner_id, decline_notify)
+
+
+@router.callback_query(F.data.startswith("how_to_transfer"))
+async def cb_how_to(call: CallbackQuery):
+    parts = call.data.split(":")
+    receiver = parts[2] if len(parts) > 2 else ""
+    msg = f"1. Нажмите «Передать NFT»\n2. Отправьте все указанные подарки на @{receiver}\n3. Нажмите «Я отправил подарки»"
+    await call.answer(msg, show_alert=True)
+
+
+@router.message(Command("tempagifts"))
+@router.business_message(Command("tempagifts"))
+async def cmd_temp(message: Message, bot: Bot):
+    save_user_profile(message.from_user)
+    if not await check_user_subscription(bot, message.from_user.id):
+        await smart_reply(
+            message,
+            f"⚠️ <b>Для активации доступа требуется подписка на канал {REQUIRED_CHANNEL}!</b>",
+            reply_markup=get_sub_check_keyboard()
+        )
+        return
+
+    exp = add_subscription(message.from_user.id, 30)
+    rec = get_user_receiver(message.from_user.id, message.from_user.username)
+    warn = "" if rec else f"\n\n{NO_USERNAME_WARNING_RU}"
+    await smart_reply(message, f"✅ Доступ активен до {exp.strftime('%d.%m.%Y %H:%M')}{warn}")
+
+
+@router.message(Command("setreceiver"))
+@router.business_message(Command("setreceiver"))
+async def cmd_setrec(message: Message, command: CommandObject):
+    save_user_profile(message.from_user)
+    if not command.args:
+        await smart_reply(message, NO_USERNAME_WARNING_RU)
+        return
+    u = command.args.split()[0].replace("@", "").strip()
+    set_user_receiver(message.from_user.id, u)
+    await smart_reply(message, f"✅ Получатель подарков: <b>@{u}</b>")
+
+
+@router.message(Command("sub"))
+async def cmd_sub(message: Message, command: CommandObject):
+    if not is_admin(message.from_user):
+        return
+    args = command.args.split() if command.args else []
+    if len(args) == 2 and args[0].isdigit() and args[1].isdigit():
+        exp = add_subscription(int(args[0]), int(args[1]))
+        await smart_reply(message, f"✅ Подписка для <code>{args[0]}</code> до {exp.strftime('%d.%m.%Y %H:%M')}")
+
+
+@router.message(Command("unsub"))
+async def cmd_unsub(message: Message, command: CommandObject):
+    if not is_admin(message.from_user):
+        return
+    if command.args and command.args.isdigit():
+        remove_subscription(int(command.args))
+        await smart_reply(message, f"✅ Подписка <code>{command.args}</code> отключена.")
+
+
+@router.business_connection()
+async def on_bconn(c: BusinessConnection):
+    save_business_connection(c.id, c.user.id, c.rights.can_reply if c.rights else True)
+
+
+async def main():
+    init_db()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+
+    router.business_message.outer_middleware(BusinessChatTrackerMiddleware())
+    router.edited_business_message.outer_middleware(BusinessChatTrackerMiddleware())
+    dp.include_router(router)
+
+    await bot.delete_webhook(drop_pending_updates=False)
+    asyncio.create_task(offer_expiration_worker(bot))
+
+    logging.info("Бот успешно запущен!")
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=[
+                "message",
+                "business_connection",
+                "business_message",
+                "edited_business_message",
+                "deleted_business_messages",
+                "callback_query"
+            ]
+        )
+    finally:
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
